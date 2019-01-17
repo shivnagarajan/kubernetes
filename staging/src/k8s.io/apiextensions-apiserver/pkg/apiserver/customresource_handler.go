@@ -28,7 +28,7 @@ import (
 	"github.com/go-openapi/spec"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/validate"
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,7 +52,6 @@ import (
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/scale/scheme/autoscalingv1"
 	"k8s.io/client-go/tools/cache"
@@ -62,10 +61,13 @@ import (
 	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion/apiextensions/internalversion"
 	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
+	"k8s.io/apiextensions-apiserver/pkg/controller/establish"
 	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
+	"k8s.io/apiextensions-apiserver/pkg/crdserverscheme"
 	apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresource"
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresource/tableconvertor"
+	"k8s.io/apiserver/pkg/util/webhook"
 )
 
 // crdHandler serves the `/apis` endpoint.
@@ -86,6 +88,14 @@ type crdHandler struct {
 	delegate          http.Handler
 	restOptionsGetter generic.RESTOptionsGetter
 	admission         admission.Interface
+
+	establishingController *establish.EstablishingController
+
+	// MasterCount is used to implement sleep to improve
+	// CRD establishing process for HA clusters.
+	masterCount int
+
+	converterFactory *conversion.CRConverterFactory
 }
 
 // crdInfo stores enough information to serve the storage for the custom resource
@@ -120,7 +130,11 @@ func NewCustomResourceDefinitionHandler(
 	crdInformer informers.CustomResourceDefinitionInformer,
 	delegate http.Handler,
 	restOptionsGetter generic.RESTOptionsGetter,
-	admission admission.Interface) *crdHandler {
+	admission admission.Interface,
+	establishingController *establish.EstablishingController,
+	serviceResolver webhook.ServiceResolver,
+	authResolverWrapper webhook.AuthenticationInfoResolverWrapper,
+	masterCount int) (*crdHandler, error) {
 	ret := &crdHandler{
 		versionDiscoveryHandler: versionDiscoveryHandler,
 		groupDiscoveryHandler:   groupDiscoveryHandler,
@@ -129,6 +143,8 @@ func NewCustomResourceDefinitionHandler(
 		delegate:                delegate,
 		restOptionsGetter:       restOptionsGetter,
 		admission:               admission,
+		establishingController:  establishingController,
+		masterCount:             masterCount,
 	}
 	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: ret.updateCustomResourceDefinition,
@@ -136,10 +152,15 @@ func NewCustomResourceDefinitionHandler(
 			ret.removeDeadStorage()
 		},
 	})
+	crConverterFactory, err := conversion.NewCRConverterFactory(serviceResolver, authResolverWrapper)
+	if err != nil {
+		return nil, err
+	}
+	ret.converterFactory = crConverterFactory
 
 	ret.customStorage.Store(crdStorageMap{})
 
-	return ret
+	return ret, nil
 }
 
 func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -181,7 +202,12 @@ func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.delegate.ServeHTTP(w, req)
 		return
 	}
-	if !apiextensions.IsCRDConditionTrue(crd, apiextensions.Established) {
+	// There is a small chance that a CRD is being served because NamesAccepted condition is true,
+	// but it becomes "unserved" because another names update leads to a conflict
+	// and EstablishingController wasn't fast enough to put the CRD into the Established condition.
+	// We accept this as the problem is small and self-healing.
+	if !apiextensions.IsCRDConditionTrue(crd, apiextensions.NamesAccepted) &&
+		!apiextensions.IsCRDConditionTrue(crd, apiextensions.Established) {
 		r.delegate.ServeHTTP(w, req)
 		return
 	}
@@ -204,10 +230,16 @@ func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var handler http.HandlerFunc
+	subresources, err := getSubresourcesForVersion(crd, requestInfo.APIVersion)
+	if err != nil {
+		utilruntime.HandleError(err)
+		http.Error(w, "the server could not properly serve the CR subresources", http.StatusInternalServerError)
+		return
+	}
 	switch {
-	case subresource == "status" && crd.Spec.Subresources != nil && crd.Spec.Subresources.Status != nil:
+	case subresource == "status" && subresources != nil && subresources.Status != nil:
 		handler = r.serveStatus(w, req, requestInfo, crdInfo, terminating, supportedTypes)
-	case subresource == "scale" && crd.Spec.Subresources != nil && crd.Spec.Subresources.Scale != nil:
+	case subresource == "scale" && subresources != nil && subresources.Scale != nil:
 		handler = r.serveScale(w, req, requestInfo, crdInfo, terminating, supportedTypes)
 	case len(subresource) == 0:
 		handler = r.serveResource(w, req, requestInfo, crdInfo, terminating, supportedTypes)
@@ -216,7 +248,7 @@ func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if handler != nil {
-		handler = metrics.InstrumentHandlerFunc(verb, resource, subresource, scope, handler)
+		handler = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, handler)
 		handler(w, req)
 		return
 	}
@@ -299,17 +331,30 @@ func (r *crdHandler) updateCustomResourceDefinition(oldObj, newObj interface{}) 
 	r.customStorageLock.Lock()
 	defer r.customStorageLock.Unlock()
 
+	// Add CRD to the establishing controller queue.
+	// For HA clusters, we want to prevent race conditions when changing status to Established,
+	// so we want to be sure that CRD is Installing at least for 5 seconds before Establishing it.
+	// TODO: find a real HA safe checkpointing mechanism instead of an arbitrary wait.
+	if !apiextensions.IsCRDConditionTrue(newCRD, apiextensions.Established) &&
+		apiextensions.IsCRDConditionTrue(newCRD, apiextensions.NamesAccepted) {
+		if r.masterCount > 1 {
+			r.establishingController.QueueCRD(newCRD.Name, 5*time.Second)
+		} else {
+			r.establishingController.QueueCRD(newCRD.Name, 0)
+		}
+	}
+
 	storageMap := r.customStorage.Load().(crdStorageMap)
 	oldInfo, found := storageMap[newCRD.UID]
 	if !found {
 		return
 	}
 	if apiequality.Semantic.DeepEqual(&newCRD.Spec, oldInfo.spec) && apiequality.Semantic.DeepEqual(&newCRD.Status.AcceptedNames, oldInfo.acceptedNames) {
-		glog.V(6).Infof("Ignoring customresourcedefinition %s update because neither spec, nor accepted names changed", oldCRD.Name)
+		klog.V(6).Infof("Ignoring customresourcedefinition %s update because neither spec, nor accepted names changed", oldCRD.Name)
 		return
 	}
 
-	glog.V(4).Infof("Updating customresourcedefinition %s", oldCRD.Name)
+	klog.V(4).Infof("Updating customresourcedefinition %s", oldCRD.Name)
 
 	// Copy because we cannot write to storageMap without a race
 	// as it is used without locking elsewhere.
@@ -349,8 +394,8 @@ func (r *crdHandler) removeDeadStorage() {
 			}
 		}
 		if !found {
-			for version, storage := range s.storages {
-				glog.V(4).Infof("Removing dead CRD storage for %v", s.requestScopes[version].Resource)
+			klog.V(4).Infof("Removing dead CRD storage for %s/%s", s.spec.Group, s.spec.Names.Kind)
+			for _, storage := range s.storages {
 				// destroy only the main storage. Those for the subresources share cacher and etcd clients.
 				storage.CustomResource.DestroyFunc()
 			}
@@ -369,6 +414,8 @@ func (r *crdHandler) GetCustomResourceListerCollectionDeleter(crd *apiextensions
 	}
 	return info.storages[info.storageVersion].CustomResource, nil
 }
+
+var swaggerMetadataDescriptions = metav1.ObjectMeta{}.SwaggerDoc()
 
 func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResourceDefinition) (*crdInfo, error) {
 	storageMap := r.customStorage.Load().(crdStorageMap)
@@ -396,7 +443,10 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 	scaleScopes := map[string]handlers.RequestScope{}
 
 	for _, v := range crd.Spec.Versions {
-		safeConverter, unsafeConverter := conversion.NewCRDConverter(crd)
+		safeConverter, unsafeConverter, err := r.converterFactory.NewConverter(crd)
+		if err != nil {
+			return nil, err
+		}
 		// In addition to Unstructured objects (Custom Resources), we also may sometimes need to
 		// decode unversioned Options objects, so we delegate to parameterScheme for such types.
 		parameterScheme := runtime.NewScheme()
@@ -412,19 +462,28 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 		typer := newUnstructuredObjectTyper(parameterScheme)
 		creator := unstructuredCreator{}
 
-		validator, _, err := apiservervalidation.NewSchemaValidator(crd.Spec.Validation)
+		validationSchema, err := getSchemaForVersion(crd, v.Name)
+		if err != nil {
+			utilruntime.HandleError(err)
+			return nil, fmt.Errorf("the server could not properly serve the CR schema")
+		}
+		validator, _, err := apiservervalidation.NewSchemaValidator(validationSchema)
 		if err != nil {
 			return nil, err
 		}
 
 		var statusSpec *apiextensions.CustomResourceSubresourceStatus
 		var statusValidator *validate.SchemaValidator
-		if utilfeature.DefaultFeatureGate.Enabled(apiextensionsfeatures.CustomResourceSubresources) && crd.Spec.Subresources != nil && crd.Spec.Subresources.Status != nil {
-			statusSpec = crd.Spec.Subresources.Status
-
+		subresources, err := getSubresourcesForVersion(crd, v.Name)
+		if err != nil {
+			utilruntime.HandleError(err)
+			return nil, fmt.Errorf("the server could not properly serve the CR subresources")
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(apiextensionsfeatures.CustomResourceSubresources) && subresources != nil && subresources.Status != nil {
+			statusSpec = subresources.Status
 			// for the status subresource, validate only against the status schema
-			if crd.Spec.Validation != nil && crd.Spec.Validation.OpenAPIV3Schema != nil && crd.Spec.Validation.OpenAPIV3Schema.Properties != nil {
-				if statusSchema, ok := crd.Spec.Validation.OpenAPIV3Schema.Properties["status"]; ok {
+			if validationSchema != nil && validationSchema.OpenAPIV3Schema != nil && validationSchema.OpenAPIV3Schema.Properties != nil {
+				if statusSchema, ok := validationSchema.OpenAPIV3Schema.Properties["status"]; ok {
 					openapiSchema := &spec.Schema{}
 					if err := apiservervalidation.ConvertJSONSchemaProps(&statusSchema, openapiSchema); err != nil {
 						return nil, err
@@ -435,18 +494,23 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 		}
 
 		var scaleSpec *apiextensions.CustomResourceSubresourceScale
-		if utilfeature.DefaultFeatureGate.Enabled(apiextensionsfeatures.CustomResourceSubresources) && crd.Spec.Subresources != nil && crd.Spec.Subresources.Scale != nil {
-			scaleSpec = crd.Spec.Subresources.Scale
+		if utilfeature.DefaultFeatureGate.Enabled(apiextensionsfeatures.CustomResourceSubresources) && subresources != nil && subresources.Scale != nil {
+			scaleSpec = subresources.Scale
 		}
 
-		// TODO: identify how to pass printer specification from the CRD
-		table, err := tableconvertor.New(nil)
+		columns, err := getColumnsForVersion(crd, v.Name)
 		if err != nil {
-			glog.V(2).Infof("The CRD for %v has an invalid printer specification, falling back to default printing: %v", kind, err)
+			utilruntime.HandleError(err)
+			return nil, fmt.Errorf("the server could not properly serve the CR columns")
+		}
+		table, err := tableconvertor.New(columns)
+		if err != nil {
+			klog.V(2).Infof("The CRD for %v has an invalid printer specification, falling back to default printing: %v", kind, err)
 		}
 
 		storages[v.Name] = customresource.NewStorage(
 			schema.GroupResource{Group: crd.Spec.Group, Resource: crd.Status.AcceptedNames.Plural},
+			schema.GroupVersionKind{Group: crd.Spec.Group, Version: v.Name, Kind: crd.Status.AcceptedNames.Kind},
 			schema.GroupVersionKind{Group: crd.Spec.Group, Version: v.Name, Kind: crd.Status.AcceptedNames.ListKind},
 			customresource.NewStrategy(
 				typer,
@@ -494,6 +558,9 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 
 			Resource: schema.GroupVersionResource{Group: crd.Spec.Group, Version: v.Name, Resource: crd.Status.AcceptedNames.Plural},
 			Kind:     kind,
+
+			// a handler for a specific group-version of a custom resource uses that version as the in-memory representation
+			HubGroupVersion: kind.GroupVersion(),
 
 			MetaGroupVersion: metav1.SchemeGroupVersion,
 
@@ -576,11 +643,12 @@ func (s unstructuredNegotiatedSerializer) SupportedMediaTypes() []runtime.Serial
 }
 
 func (s unstructuredNegotiatedSerializer) EncoderForVersion(encoder runtime.Encoder, gv runtime.GroupVersioner) runtime.Encoder {
-	return versioning.NewCodec(encoder, nil, s.converter, Scheme, Scheme, Scheme, gv, nil)
+	return versioning.NewCodec(encoder, nil, s.converter, Scheme, Scheme, Scheme, gv, nil, "crdNegotiatedSerializer")
 }
 
 func (s unstructuredNegotiatedSerializer) DecoderToVersion(decoder runtime.Decoder, gv runtime.GroupVersioner) runtime.Decoder {
-	return versioning.NewDefaultingCodecForScheme(Scheme, nil, decoder, nil, gv)
+	d := schemaCoercingDecoder{delegate: decoder, validator: unstructuredSchemaCoercer{}}
+	return versioning.NewDefaultingCodecForScheme(Scheme, nil, d, nil, gv)
 }
 
 type UnstructuredObjectTyper struct {
@@ -591,7 +659,7 @@ type UnstructuredObjectTyper struct {
 func newUnstructuredObjectTyper(Delegate runtime.ObjectTyper) UnstructuredObjectTyper {
 	return UnstructuredObjectTyper{
 		Delegate:          Delegate,
-		UnstructuredTyper: discovery.NewUnstructuredObjectTyper(),
+		UnstructuredTyper: crdserverscheme.NewUnstructuredObjectTyper(),
 	}
 }
 
@@ -633,6 +701,7 @@ type CRDRESTOptionsGetter struct {
 	DefaultWatchCacheSize   int
 	EnableGarbageCollection bool
 	DeleteCollectionWorkers int
+	CountMetricPollPeriod   time.Duration
 }
 
 func (t CRDRESTOptionsGetter) GetRESTOptions(resource schema.GroupResource) (generic.RESTOptions, error) {
@@ -642,6 +711,7 @@ func (t CRDRESTOptionsGetter) GetRESTOptions(resource schema.GroupResource) (gen
 		EnableGarbageCollection: t.EnableGarbageCollection,
 		DeleteCollectionWorkers: t.DeleteCollectionWorkers,
 		ResourcePrefix:          resource.Group + "/" + resource.Resource,
+		CountMetricPollPeriod:   t.CountMetricPollPeriod,
 	}
 	if t.EnableWatchCache {
 		ret.Decorator = genericregistry.StorageWithCacher(t.DefaultWatchCacheSize)
@@ -674,7 +744,189 @@ type crdConversionRESTOptionsGetter struct {
 func (t crdConversionRESTOptionsGetter) GetRESTOptions(resource schema.GroupResource) (generic.RESTOptions, error) {
 	ret, err := t.RESTOptionsGetter.GetRESTOptions(resource)
 	if err == nil {
-		ret.StorageConfig.Codec = versioning.NewCodec(ret.StorageConfig.Codec, ret.StorageConfig.Codec, t.converter, &unstructuredCreator{}, discovery.NewUnstructuredObjectTyper(), &unstructuredDefaulter{delegate: Scheme}, t.encoderVersion, t.decoderVersion)
+		d := schemaCoercingDecoder{delegate: ret.StorageConfig.Codec, validator: unstructuredSchemaCoercer{
+			// drop invalid fields while decoding old CRs (before we had any ObjectMeta validation)
+			dropInvalidMetadata: true,
+		}}
+		c := schemaCoercingConverter{delegate: t.converter, validator: unstructuredSchemaCoercer{}}
+		ret.StorageConfig.Codec = versioning.NewCodec(
+			ret.StorageConfig.Codec,
+			d,
+			c,
+			&unstructuredCreator{},
+			crdserverscheme.NewUnstructuredObjectTyper(),
+			&unstructuredDefaulter{delegate: Scheme},
+			t.encoderVersion,
+			t.decoderVersion,
+			"crdRESTOptions",
+		)
 	}
 	return ret, err
+}
+
+// schemaCoercingDecoder calls the delegate decoder, and then applies the Unstructured schema validator
+// to coerce the schema.
+type schemaCoercingDecoder struct {
+	delegate  runtime.Decoder
+	validator unstructuredSchemaCoercer
+}
+
+var _ runtime.Decoder = schemaCoercingDecoder{}
+
+func (d schemaCoercingDecoder) Decode(data []byte, defaults *schema.GroupVersionKind, into runtime.Object) (runtime.Object, *schema.GroupVersionKind, error) {
+	obj, gvk, err := d.delegate.Decode(data, defaults, into)
+	if err != nil {
+		return nil, gvk, err
+	}
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		if err := d.validator.apply(u); err != nil {
+			return nil, gvk, err
+		}
+	}
+
+	return obj, gvk, nil
+}
+
+// schemaCoercingConverter calls the delegate converter and applies the Unstructured validator to
+// coerce the schema.
+type schemaCoercingConverter struct {
+	delegate  runtime.ObjectConvertor
+	validator unstructuredSchemaCoercer
+}
+
+var _ runtime.ObjectConvertor = schemaCoercingConverter{}
+
+func (v schemaCoercingConverter) Convert(in, out, context interface{}) error {
+	if err := v.delegate.Convert(in, out, context); err != nil {
+		return err
+	}
+
+	if u, ok := out.(*unstructured.Unstructured); ok {
+		if err := v.validator.apply(u); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (v schemaCoercingConverter) ConvertToVersion(in runtime.Object, gv runtime.GroupVersioner) (runtime.Object, error) {
+	out, err := v.delegate.ConvertToVersion(in, gv)
+	if err != nil {
+		return nil, err
+	}
+
+	if u, ok := out.(*unstructured.Unstructured); ok {
+		if err := v.validator.apply(u); err != nil {
+			return nil, err
+		}
+	}
+
+	return out, nil
+}
+
+func (v schemaCoercingConverter) ConvertFieldLabel(gvk schema.GroupVersionKind, label, value string) (string, string, error) {
+	return v.delegate.ConvertFieldLabel(gvk, label, value)
+}
+
+// unstructuredSchemaCoercer does the validation for Unstructured that json.Unmarshal
+// does for native types. This includes:
+// - validating and pruning ObjectMeta (here with optional error instead of pruning)
+// - TODO: application of an OpenAPI validator (against the whole object or a top-level field of it).
+// - TODO: optionally application of post-validation algorithms like defaulting and/or OpenAPI based pruning.
+type unstructuredSchemaCoercer struct {
+	dropInvalidMetadata bool
+}
+
+func (v *unstructuredSchemaCoercer) apply(u *unstructured.Unstructured) error {
+	// save implicit meta fields that don't have to be specified in the validation spec
+	kind, foundKind, err := unstructured.NestedString(u.UnstructuredContent(), "kind")
+	if err != nil {
+		return err
+	}
+	apiVersion, foundApiVersion, err := unstructured.NestedString(u.UnstructuredContent(), "apiVersion")
+	if err != nil {
+		return err
+	}
+	objectMeta, foundObjectMeta, err := getObjectMeta(u, v.dropInvalidMetadata)
+	if err != nil {
+		return err
+	}
+
+	// restore meta fields, starting clean
+	if foundKind {
+		u.SetKind(kind)
+	}
+	if foundApiVersion {
+		u.SetAPIVersion(apiVersion)
+	}
+	if foundObjectMeta {
+		if err := setObjectMeta(u, objectMeta); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+var encodingjson = json.CaseSensitiveJsonIterator()
+
+func getObjectMeta(u *unstructured.Unstructured, dropMalformedFields bool) (*metav1.ObjectMeta, bool, error) {
+	metadata, found := u.UnstructuredContent()["metadata"]
+	if !found {
+		return nil, false, nil
+	}
+
+	// round-trip through JSON first, hoping that unmarshaling just works
+	objectMeta := &metav1.ObjectMeta{}
+	metadataBytes, err := encodingjson.Marshal(metadata)
+	if err != nil {
+		return nil, false, err
+	}
+	if err = encodingjson.Unmarshal(metadataBytes, objectMeta); err == nil {
+		// if successful, return
+		return objectMeta, true, nil
+	}
+	if !dropMalformedFields {
+		// if we're not trying to drop malformed fields, return the error
+		return nil, true, err
+	}
+
+	metadataMap, ok := metadata.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("invalid metadata: expected object, got %T", metadata)
+	}
+
+	// Go field by field accumulating into the metadata object.
+	// This takes advantage of the fact that you can repeatedly unmarshal individual fields into a single struct,
+	// each iteration preserving the old key-values.
+	accumulatedObjectMeta := &metav1.ObjectMeta{}
+	testObjectMeta := &metav1.ObjectMeta{}
+	for k, v := range metadataMap {
+		// serialize a single field
+		if singleFieldBytes, err := encodingjson.Marshal(map[string]interface{}{k: v}); err == nil {
+			// do a test unmarshal
+			if encodingjson.Unmarshal(singleFieldBytes, testObjectMeta) == nil {
+				// if that succeeds, unmarshal for real
+				encodingjson.Unmarshal(singleFieldBytes, accumulatedObjectMeta)
+			}
+		}
+	}
+
+	return accumulatedObjectMeta, true, nil
+}
+
+func setObjectMeta(u *unstructured.Unstructured, objectMeta *metav1.ObjectMeta) error {
+	if objectMeta == nil {
+		unstructured.RemoveNestedField(u.UnstructuredContent(), "metadata")
+		return nil
+	}
+
+	metadata, err := runtime.DefaultUnstructuredConverter.ToUnstructured(objectMeta)
+	if err != nil {
+		return err
+	}
+
+	u.UnstructuredContent()["metadata"] = metadata
+	return nil
 }

@@ -26,10 +26,10 @@ set -o pipefail
 ### Hardcoded constants
 DEFAULT_CNI_VERSION="v0.6.0"
 DEFAULT_CNI_SHA1="d595d3ded6499a64e8dac02466e2f5f2ce257c9f"
-DEFAULT_NPD_VERSION="v0.4.1"
-DEFAULT_NPD_SHA1="a57a3fe64cab8a18ec654f5cef0aec59dae62568"
-DEFAULT_CRICTL_VERSION="v1.0.0-beta.1"
-DEFAULT_CRICTL_SHA1="6816982ea1b83506945ce02949199171fee17b0b"
+DEFAULT_NPD_VERSION="v0.6.0"
+DEFAULT_NPD_SHA1="a28e960a21bb74bc0ae09c267b6a340f30e5b3a6"
+DEFAULT_CRICTL_VERSION="v1.12.0"
+DEFAULT_CRICTL_SHA1="82ef8b44849f9da0589c87e9865d4716573eec7f"
 DEFAULT_MOUNTER_TAR_SHA="8003b798cf33c7f91320cd6ee5cec4fa22244571"
 ###
 
@@ -247,6 +247,11 @@ function install-crictl {
   fi
   local -r crictl="crictl-${crictl_version}-linux-amd64"
 
+  # Create crictl config file.
+  cat > /etc/crictl.yaml <<EOF
+runtime-endpoint: ${CONTAINER_RUNTIME_ENDPOINT:-unix:///var/run/dockershim.sock}
+EOF
+
   if is-preloaded "${crictl}" "${crictl_sha1}"; then
     echo "crictl is preloaded"
     return
@@ -257,11 +262,27 @@ function install-crictl {
   download-or-bust "${crictl_sha1}" "${crictl_path}/${crictl}"
   mv "${KUBE_HOME}/${crictl}" "${KUBE_BIN}/crictl"
   chmod a+x "${KUBE_BIN}/crictl"
+}
 
-  # Create crictl config file.
-  cat > /etc/crictl.yaml <<EOF
-runtime-endpoint: ${CONTAINER_RUNTIME_ENDPOINT:-unix:///var/run/dockershim.sock}
-EOF
+function install-exec-auth-plugin {
+  if [[ ! "${EXEC_AUTH_PLUGIN_URL:-}" ]]; then
+      return
+  fi
+  local -r plugin_url="${EXEC_AUTH_PLUGIN_URL}"
+  local -r plugin_sha1="${EXEC_AUTH_PLUGIN_SHA1}"
+
+  echo "Downloading gke-exec-auth-plugin binary"
+  download-or-bust "${plugin_sha1}" "${plugin_url}"
+  mv "${KUBE_HOME}/gke-exec-auth-plugin" "${KUBE_BIN}/gke-exec-auth-plugin"
+  chmod a+x "${KUBE_BIN}/gke-exec-auth-plugin"
+
+  if [[ ! "${EXEC_AUTH_PLUGIN_LICENSE_URL:-}" ]]; then
+      return
+  fi
+  local -r license_url="${EXEC_AUTH_PLUGIN_LICENSE_URL}"
+  echo "Downloading gke-exec-auth-plugin license"
+  download-or-bust "" "${license_url}"
+  mv "${KUBE_HOME}/LICENSE" "${KUBE_BIN}/gke-exec-auth-plugin-license"
 }
 
 function install-kube-manifests {
@@ -294,6 +315,10 @@ function install-kube-manifests {
       xargs sed -ri "s@(image\":\s+\")k8s.gcr.io@\1${kube_addon_registry}@"
   fi
   cp "${dst_dir}/kubernetes/gci-trusty/gci-configure-helper.sh" "${KUBE_BIN}/configure-helper.sh"
+  if [[ -e "${dst_dir}/kubernetes/gci-trusty/gke-internal-configure-helper.sh" ]]; then
+    cp "${dst_dir}/kubernetes/gci-trusty/gke-internal-configure-helper.sh" "${KUBE_BIN}/"
+  fi
+
   cp "${dst_dir}/kubernetes/gci-trusty/health-monitor.sh" "${KUBE_BIN}/health-monitor.sh"
 
   rm -f "${KUBE_HOME}/${manifests_tar}"
@@ -402,6 +427,11 @@ function install-kube-binary-config {
 
   # Install crictl on each node.
   install-crictl
+
+  if [[ "${KUBERNETES_MASTER:-}" == "false" ]]; then
+    # TODO(awly): include the binary and license in the OS image.
+    install-exec-auth-plugin
+  fi
 
   # Clean up.
   rm -rf "${KUBE_HOME}/kubernetes"

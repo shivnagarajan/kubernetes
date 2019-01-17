@@ -31,10 +31,11 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/pkg/client/conditions"
 	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/storage/testsuites"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 )
 
-var _ = utils.SIGDescribe("Mounted volume expand [Feature:ExpandPersistentVolumes] [Slow]", func() {
+var _ = utils.SIGDescribe("Mounted volume expand[Slow]", func() {
 	var (
 		c                 clientset.Interface
 		ns                string
@@ -72,9 +73,9 @@ var _ = utils.SIGDescribe("Mounted volume expand [Feature:ExpandPersistentVolume
 			isNodeLabeled = true
 		}
 
-		test := storageClassTest{
-			name:      "default",
-			claimSize: "2Gi",
+		test := testsuites.StorageClassTest{
+			Name:      "default",
+			ClaimSize: "2Gi",
 		}
 		resizableSc, err = createResizableStorageClass(test, ns, "resizing", c)
 		Expect(err).NotTo(HaveOccurred(), "Error creating resizable storage class")
@@ -113,6 +114,7 @@ var _ = utils.SIGDescribe("Mounted volume expand [Feature:ExpandPersistentVolume
 
 		By("Creating a deployment with the provisioned volume")
 		deployment, err := framework.CreateDeployment(c, int32(1), map[string]string{"test": "app"}, nodeKeyValueLabel, ns, pvcClaims, "")
+		Expect(err).NotTo(HaveOccurred(), "Failed creating deployment %v", err)
 		defer c.AppsV1().Deployments(ns).Delete(deployment.Name, &metav1.DeleteOptions{})
 
 		By("Expanding current pvc")

@@ -25,98 +25,104 @@ import (
 
 func TestPrintConfiguration(t *testing.T) {
 	var tests = []struct {
-		cfg           *kubeadmapi.MasterConfiguration
+		name          string
+		cfg           *kubeadmapi.ClusterConfiguration
 		buf           *bytes.Buffer
 		expectedBytes []byte
 	}{
 		{
+			name:          "config is nil",
 			cfg:           nil,
 			expectedBytes: []byte(""),
 		},
 		{
-			cfg: &kubeadmapi.MasterConfiguration{
+			name: "cluster config with local Etcd",
+			cfg: &kubeadmapi.ClusterConfiguration{
 				KubernetesVersion: "v1.7.1",
+				Etcd: kubeadmapi.Etcd{
+					Local: &kubeadmapi.LocalEtcd{
+						DataDir: "/some/path",
+					},
+				},
+				DNS: kubeadmapi.DNS{
+					Type: kubeadmapi.CoreDNS,
+				},
 			},
 			expectedBytes: []byte(`[upgrade/config] Configuration used:
-	api:
-	  advertiseAddress: ""
-	  bindPort: 0
-	  controlPlaneEndpoint: ""
-	apiVersion: kubeadm.k8s.io/v1alpha2
-	auditPolicy:
-	  logDir: ""
-	  path: ""
+	apiServer: {}
+	apiVersion: kubeadm.k8s.io/v1beta1
 	certificatesDir: ""
+	controlPlaneEndpoint: ""
+	controllerManager: {}
+	dns:
+	  type: CoreDNS
 	etcd:
-	  caFile: ""
-	  certFile: ""
-	  dataDir: ""
-	  endpoints: null
-	  image: ""
-	  keyFile: ""
+	  local:
+	    dataDir: /some/path
 	imageRepository: ""
-	kind: MasterConfiguration
-	kubeProxy: {}
-	kubeletConfiguration: {}
+	kind: ClusterConfiguration
 	kubernetesVersion: v1.7.1
 	networking:
 	  dnsDomain: ""
 	  podSubnet: ""
 	  serviceSubnet: ""
-	nodeName: ""
-	token: ""
-	unifiedControlPlaneImage: ""
+	scheduler: {}
 `),
 		},
 		{
-			cfg: &kubeadmapi.MasterConfiguration{
+			name: "cluster config with ServiceSubnet and external Etcd",
+			cfg: &kubeadmapi.ClusterConfiguration{
 				KubernetesVersion: "v1.7.1",
 				Networking: kubeadmapi.Networking{
 					ServiceSubnet: "10.96.0.1/12",
 				},
+				Etcd: kubeadmapi.Etcd{
+					External: &kubeadmapi.ExternalEtcd{
+						Endpoints: []string{"https://one-etcd-instance:2379"},
+					},
+				},
+				DNS: kubeadmapi.DNS{
+					Type: kubeadmapi.CoreDNS,
+				},
 			},
 			expectedBytes: []byte(`[upgrade/config] Configuration used:
-	api:
-	  advertiseAddress: ""
-	  bindPort: 0
-	  controlPlaneEndpoint: ""
-	apiVersion: kubeadm.k8s.io/v1alpha2
-	auditPolicy:
-	  logDir: ""
-	  path: ""
+	apiServer: {}
+	apiVersion: kubeadm.k8s.io/v1beta1
 	certificatesDir: ""
+	controlPlaneEndpoint: ""
+	controllerManager: {}
+	dns:
+	  type: CoreDNS
 	etcd:
-	  caFile: ""
-	  certFile: ""
-	  dataDir: ""
-	  endpoints: null
-	  image: ""
-	  keyFile: ""
+	  external:
+	    caFile: ""
+	    certFile: ""
+	    endpoints:
+	    - https://one-etcd-instance:2379
+	    keyFile: ""
 	imageRepository: ""
-	kind: MasterConfiguration
-	kubeProxy: {}
-	kubeletConfiguration: {}
+	kind: ClusterConfiguration
 	kubernetesVersion: v1.7.1
 	networking:
 	  dnsDomain: ""
 	  podSubnet: ""
 	  serviceSubnet: 10.96.0.1/12
-	nodeName: ""
-	token: ""
-	unifiedControlPlaneImage: ""
+	scheduler: {}
 `),
 		},
 	}
 	for _, rt := range tests {
-		rt.buf = bytes.NewBufferString("")
-		printConfiguration(rt.cfg, rt.buf)
-		actualBytes := rt.buf.Bytes()
-		if !bytes.Equal(actualBytes, rt.expectedBytes) {
-			t.Errorf(
-				"failed PrintConfiguration:\n\texpected: %q\n\t  actual: %q",
-				string(rt.expectedBytes),
-				string(actualBytes),
-			)
-		}
+		t.Run(rt.name, func(t *testing.T) {
+			rt.buf = bytes.NewBufferString("")
+			printConfiguration(rt.cfg, rt.buf)
+			actualBytes := rt.buf.Bytes()
+			if !bytes.Equal(actualBytes, rt.expectedBytes) {
+				t.Errorf(
+					"failed PrintConfiguration:\n\texpected: %q\n\t  actual: %q",
+					string(rt.expectedBytes),
+					string(actualBytes),
+				)
+			}
+		})
 	}
 }

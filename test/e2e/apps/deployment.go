@@ -36,14 +36,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
-	scaleclient "k8s.io/client-go/scale"
 	appsinternal "k8s.io/kubernetes/pkg/apis/apps"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	deploymentutil "k8s.io/kubernetes/pkg/controller/deployment/util"
-	"k8s.io/kubernetes/pkg/kubectl"
-	utilpointer "k8s.io/kubernetes/pkg/util/pointer"
 	"k8s.io/kubernetes/test/e2e/framework"
 	testutil "k8s.io/kubernetes/test/utils"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 const (
@@ -73,16 +70,35 @@ var _ = SIGDescribe("Deployment", func() {
 	It("deployment reaping should cascade to its replica sets and pods", func() {
 		testDeleteDeployment(f)
 	})
-	It("RollingUpdateDeployment should delete old pods and create new ones", func() {
+	/*
+	  Testname: Deployment RollingUpdate
+	  Description: A conformant Kubernetes distribution MUST support the Deployment with RollingUpdate strategy.
+	*/
+	framework.ConformanceIt("RollingUpdateDeployment should delete old pods and create new ones", func() {
 		testRollingUpdateDeployment(f)
 	})
-	It("RecreateDeployment should delete old pods and create new ones", func() {
+	/*
+	  Testname: Deployment Recreate
+	  Description: A conformant Kubernetes distribution MUST support the Deployment with Recreate strategy.
+	*/
+	framework.ConformanceIt("RecreateDeployment should delete old pods and create new ones", func() {
 		testRecreateDeployment(f)
 	})
-	It("deployment should delete old replica sets", func() {
+	/*
+	  Testname: Deployment RevisionHistoryLimit
+	  Description: A conformant Kubernetes distribution MUST clean up Deployment's ReplicaSets based on
+	  the Deployment's `.spec.revisionHistoryLimit`.
+	*/
+	framework.ConformanceIt("deployment should delete old replica sets", func() {
 		testDeploymentCleanUpPolicy(f)
 	})
-	It("deployment should support rollover", func() {
+	/*
+	  Testname: Deployment Rollover
+	  Description: A conformant Kubernetes distribution MUST support Deployment rollover,
+	    i.e. allow arbitrary number of changes to desired state during rolling update
+	    before the rollout finishes.
+	*/
+	framework.ConformanceIt("deployment should support rollover", func() {
 		testRolloverDeployment(f)
 	})
 	It("deployment should support rollback", func() {
@@ -94,7 +110,13 @@ var _ = SIGDescribe("Deployment", func() {
 	It("test Deployment ReplicaSet orphaning and adoption regarding controllerRef", func() {
 		testDeploymentsControllerRef(f)
 	})
-	It("deployment should support proportional scaling", func() {
+	/*
+	  Testname: Deployment Proportional Scaling
+	  Description: A conformant Kubernetes distribution MUST support Deployment
+	    proportional scaling, i.e. proportionally scale a Deployment's ReplicaSets
+	    when a Deployment is scaled.
+	*/
+	framework.ConformanceIt("deployment should support proportional scaling", func() {
 		testProportionalScalingDeployment(f)
 	})
 	// TODO: add tests that cover deployment.Spec.MinReadySeconds once we solved clock-skew issues
@@ -141,6 +163,10 @@ func failureTrap(c clientset.Interface, ns string) {
 		}
 		options := metav1.ListOptions{LabelSelector: selector.String()}
 		podList, err := c.CoreV1().Pods(rs.Namespace).List(options)
+		if err != nil {
+			framework.Logf("Failed to list Pods in namespace %s: %v", rs.Namespace, err)
+			continue
+		}
 		for _, pod := range podList.Items {
 			framework.Logf(spew.Sprintf("pod: %q:\n%+v\n", pod.Name, pod))
 		}
@@ -160,17 +186,12 @@ func newDeploymentRollback(name string, annotations map[string]string, revision 
 	}
 }
 
-func stopDeployment(c clientset.Interface, internalClient internalclientset.Interface, scaleClient scaleclient.ScalesGetter, ns, deploymentName string) {
+func stopDeployment(c clientset.Interface, ns, deploymentName string) {
 	deployment, err := c.AppsV1().Deployments(ns).Get(deploymentName, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
 	framework.Logf("Deleting deployment %s", deploymentName)
-	reaper, err := kubectl.ReaperFor(appsinternal.Kind("Deployment"), internalClient, scaleClient)
-	Expect(err).NotTo(HaveOccurred())
-	timeout := 1 * time.Minute
-
-	err = reaper.Stop(ns, deployment.Name, timeout, metav1.NewDeleteOptions(0))
-	Expect(err).NotTo(HaveOccurred())
+	framework.ExpectNoError(framework.DeleteResourceAndWaitForGC(c, appsinternal.Kind("Deployment"), ns, deployment.Name))
 
 	framework.Logf("Ensuring deployment %s was deleted", deploymentName)
 	_, err = c.AppsV1().Deployments(ns).Get(deployment.Name, metav1.GetOptions{})
@@ -203,7 +224,6 @@ func stopDeployment(c clientset.Interface, internalClient internalclientset.Inte
 func testDeleteDeployment(f *framework.Framework) {
 	ns := f.Namespace.Name
 	c := f.ClientSet
-	internalClient := f.InternalClientset
 
 	deploymentName := "test-new-deployment"
 	podLabels := map[string]string{"name": NginxImageName}
@@ -226,7 +246,7 @@ func testDeleteDeployment(f *framework.Framework) {
 	newRS, err := deploymentutil.GetNewReplicaSet(deployment, c.AppsV1())
 	Expect(err).NotTo(HaveOccurred())
 	Expect(newRS).NotTo(Equal(nilRs))
-	stopDeployment(c, internalClient, f.ScalesGetter, ns, deploymentName)
+	stopDeployment(c, ns, deploymentName)
 }
 
 func testRollingUpdateDeployment(f *framework.Framework) {

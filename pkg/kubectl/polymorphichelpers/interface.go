@@ -23,20 +23,19 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/rest"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubectl"
-	"k8s.io/kubernetes/pkg/kubectl/genericclioptions"
 )
 
 // LogsForObjectFunc is a function type that can tell you how to get logs for a runtime.object
-type LogsForObjectFunc func(restClientGetter genericclioptions.RESTClientGetter, object, options runtime.Object, timeout time.Duration) (*rest.Request, error)
+type LogsForObjectFunc func(restClientGetter genericclioptions.RESTClientGetter, object, options runtime.Object, timeout time.Duration, allContainers bool) ([]*rest.Request, error)
 
 // LogsForObjectFn gives a way to easily override the function for unit testing if needed.
 var LogsForObjectFn LogsForObjectFunc = logsForObject
 
 // AttachableLogsForObjectFunc is a function type that can tell you how to get the pod for which to attach a given object
-type AttachableLogsForObjectFunc func(restClientGetter genericclioptions.RESTClientGetter, object runtime.Object, timeout time.Duration) (*api.Pod, error)
+type AttachableLogsForObjectFunc func(restClientGetter genericclioptions.RESTClientGetter, object runtime.Object, timeout time.Duration) (*v1.Pod, error)
 
 // AttachablePodForObjectFn gives a way to easily override the function for unit testing if needed.
 var AttachablePodForObjectFn AttachableLogsForObjectFunc = attachablePodForObject
@@ -48,7 +47,7 @@ type HistoryViewerFunc func(restClientGetter genericclioptions.RESTClientGetter,
 var HistoryViewerFn HistoryViewerFunc = historyViewer
 
 // StatusViewerFunc is a function type that can tell you how to print rollout status
-type StatusViewerFunc func(restClientGetter genericclioptions.RESTClientGetter, mapping *meta.RESTMapping) (kubectl.StatusViewer, error)
+type StatusViewerFunc func(mapping *meta.RESTMapping) (kubectl.StatusViewer, error)
 
 // StatusViewerFn gives a way to easily override the function for unit testing if needed
 var StatusViewerFn StatusViewerFunc = statusViewer
@@ -59,6 +58,20 @@ type UpdatePodSpecForObjectFunc func(obj runtime.Object, fn func(*v1.PodSpec) er
 
 // UpdatePodSpecForObjectFn gives a way to easily override the function for unit testing if needed
 var UpdatePodSpecForObjectFn UpdatePodSpecForObjectFunc = updatePodSpecForObject
+
+// MapBasedSelectorForObjectFunc will call the provided function on mapping the baesd selector for object,
+// return "" if object is not supported, or return an error.
+type MapBasedSelectorForObjectFunc func(object runtime.Object) (string, error)
+
+// MapBasedSelectorForObjectFn gives a way to easily override the function for unit testing if needed
+var MapBasedSelectorForObjectFn MapBasedSelectorForObjectFunc = mapBasedSelectorForObject
+
+// ProtocolsForObjectFunc will call the provided function on the protocols for the object,
+// return nil-map if no protocols for the object, or return an error.
+type ProtocolsForObjectFunc func(object runtime.Object) (map[string]string, error)
+
+// ProtocolsForObjectFn gives a way to easily override the function for unit testing if needed
+var ProtocolsForObjectFn ProtocolsForObjectFunc = protocolsForObject
 
 // PortsForObjectFunc returns the ports associated with the provided object
 type PortsForObjectFunc func(object runtime.Object) ([]string, error)

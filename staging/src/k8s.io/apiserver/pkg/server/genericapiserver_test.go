@@ -31,12 +31,14 @@ import (
 	"testing"
 	"time"
 
+	openapi "github.com/go-openapi/spec"
 	"github.com/stretchr/testify/assert"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/apiserver/pkg/apis/example"
@@ -44,6 +46,7 @@ import (
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
+	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
 	"k8s.io/client-go/informers"
@@ -73,19 +76,56 @@ func init() {
 		&metav1.APIGroup{},
 		&metav1.APIResourceList{},
 	)
-	example.AddToScheme(scheme)
-	examplev1.AddToScheme(scheme)
+	utilruntime.Must(example.AddToScheme(scheme))
+	utilruntime.Must(examplev1.AddToScheme(scheme))
+}
+
+func buildTestOpenAPIDefinition() kubeopenapi.OpenAPIDefinition {
+	return kubeopenapi.OpenAPIDefinition{
+		Schema: openapi.Schema{
+			SchemaProps: openapi.SchemaProps{
+				Description: "Description",
+				Properties:  map[string]openapi.Schema{},
+			},
+			VendorExtensible: openapi.VendorExtensible{
+				Extensions: openapi.Extensions{
+					"x-kubernetes-group-version-kind": []map[string]string{
+						{
+							"group":   "",
+							"version": "v1",
+							"kind":    "Getter",
+						},
+						{
+							"group":   "batch",
+							"version": "v1",
+							"kind":    "Getter",
+						},
+						{
+							"group":   "extensions",
+							"version": "v1",
+							"kind":    "Getter",
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 func testGetOpenAPIDefinitions(_ kubeopenapi.ReferenceCallback) map[string]kubeopenapi.OpenAPIDefinition {
 	return map[string]kubeopenapi.OpenAPIDefinition{
-		"k8s.io/apimachinery/pkg/apis/meta/v1.APIGroupList": {},
+		"k8s.io/apimachinery/pkg/apis/meta/v1.Status":          {},
+		"k8s.io/apimachinery/pkg/apis/meta/v1.APIVersions":     {},
+		"k8s.io/apimachinery/pkg/apis/meta/v1.APIGroupList":    {},
+		"k8s.io/apimachinery/pkg/apis/meta/v1.APIGroup":        buildTestOpenAPIDefinition(),
+		"k8s.io/apimachinery/pkg/apis/meta/v1.APIResourceList": {},
 	}
 }
 
 // setUp is a convience function for setting up for (most) tests.
 func setUp(t *testing.T) (Config, *assert.Assertions) {
 	config := NewConfig(codecs)
+	config.ExternalAddress = "192.168.10.4:443"
 	config.PublicAddress = net.ParseIP("192.168.10.4")
 	config.LegacyAPIGroupPrefixes = sets.NewString("/api")
 	config.LoopbackClientConfig = &restclient.Config{}
@@ -95,9 +135,8 @@ func setUp(t *testing.T) (Config, *assert.Assertions) {
 		t.Fatal("unable to create fake client set")
 	}
 
-	config.OpenAPIConfig = DefaultOpenAPIConfig(testGetOpenAPIDefinitions, runtime.NewScheme())
+	config.OpenAPIConfig = DefaultOpenAPIConfig(testGetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(runtime.NewScheme()))
 	config.OpenAPIConfig.Info.Version = "unversioned"
-	config.SwaggerConfig = DefaultSwaggerConfig()
 	sharedInformers := informers.NewSharedInformerFactory(clientset, config.LoopbackClientConfig.Timeout)
 	config.Complete(sharedInformers)
 
@@ -122,11 +161,6 @@ func TestNew(t *testing.T) {
 	// Verify many of the variables match their config counterparts
 	assert.Equal(s.legacyAPIGroupPrefixes, config.LegacyAPIGroupPrefixes)
 	assert.Equal(s.admissionControl, config.AdmissionControl)
-
-	// these values get defaulted
-	assert.Equal(net.JoinHostPort(config.PublicAddress.String(), "443"), s.ExternalAddress)
-	assert.NotNil(s.swaggerConfig)
-	assert.Equal("http://"+s.ExternalAddress, s.swaggerConfig.WebServicesUrl)
 }
 
 // Verifies that AddGroupVersions works as expected.
@@ -281,7 +315,7 @@ func TestInstallAPIGroups(t *testing.T) {
 func TestPrepareRun(t *testing.T) {
 	s, config, assert := newMaster(t)
 
-	assert.NotNil(config.SwaggerConfig)
+	assert.NotNil(config.OpenAPIConfig)
 
 	server := httptest.NewServer(s.Handler.Director)
 	defer server.Close()
@@ -290,8 +324,8 @@ func TestPrepareRun(t *testing.T) {
 	s.PrepareRun()
 	s.RunPostStartHooks(done)
 
-	// swagger is installed in PrepareRun
-	resp, err := http.Get(server.URL + "/swaggerapi/")
+	// openapi is installed in PrepareRun
+	resp, err := http.Get(server.URL + "/openapi/v2")
 	assert.NoError(err)
 	assert.Equal(http.StatusOK, resp.StatusCode)
 
@@ -366,10 +400,8 @@ func TestNotRestRoutesHaveAuth(t *testing.T) {
 	config.LegacyAPIGroupPrefixes = sets.NewString("/apiPrefix")
 	config.Authorization.Authorizer = &authz
 
-	config.EnableSwaggerUI = true
 	config.EnableIndex = true
 	config.EnableProfiling = true
-	config.SwaggerConfig = DefaultSwaggerConfig()
 
 	kubeVersion := fakeVersion()
 	config.Version = &kubeVersion
@@ -383,8 +415,8 @@ func TestNotRestRoutesHaveAuth(t *testing.T) {
 		route string
 	}{
 		{"/"},
-		{"/swagger-ui/"},
 		{"/debug/pprof/"},
+		{"/debug/flags/"},
 		{"/version"},
 	} {
 		resp := httptest.NewRecorder()
@@ -476,19 +508,23 @@ func TestGracefulShutdown(t *testing.T) {
 		return handler
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		wg.Done()
-		time.Sleep(2 * time.Second)
-		w.WriteHeader(http.StatusOK)
-		graceShutdown = true
-	})
-
 	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
 	if err != nil {
 		t.Fatalf("Error in bringing up the server: %v", err)
 	}
 
-	s.Handler.NonGoRestfulMux.Handle("/test", handler)
+	twoSecondHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		wg.Done()
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+		graceShutdown = true
+	})
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	s.Handler.NonGoRestfulMux.Handle("/test", twoSecondHandler)
+	s.Handler.NonGoRestfulMux.Handle("/200", okHandler)
 
 	insecureServer := &http.Server{
 		Addr:    "0.0.0.0:0",
@@ -524,6 +560,12 @@ func TestGracefulShutdown(t *testing.T) {
 	// close stopCh after request sent to server to guarantee request handler is running.
 	wg.Wait()
 	close(stopCh)
+
+	time.Sleep(500 * time.Millisecond)
+	if _, err := http.Get("http://127.0.0.1:" + strconv.Itoa(serverPort) + "/200"); err == nil {
+		t.Errorf("Unexpected http success after stopCh was closed")
+	}
+
 	// wait for wait group handler finish
 	s.HandlerChainWaitGroup.Wait()
 

@@ -63,4 +63,19 @@ func SetDefaults_CustomResourceDefinitionSpec(obj *CustomResourceDefinitionSpec)
 	if len(obj.Version) == 0 && len(obj.Versions) != 0 {
 		obj.Version = obj.Versions[0].Name
 	}
+	if obj.Conversion == nil {
+		obj.Conversion = &CustomResourceConversion{
+			Strategy: NoneConverter,
+		}
+	}
+}
+
+// hasPerVersionColumns returns true if a CRD uses per-version columns.
+func hasPerVersionColumns(versions []CustomResourceDefinitionVersion) bool {
+	for _, v := range versions {
+		if len(v.AdditionalPrinterColumns) > 0 {
+			return true
+		}
+	}
+	return false
 }
