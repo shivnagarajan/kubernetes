@@ -119,7 +119,7 @@ func NewDisruptionController(
 	dc := &DisruptionController{
 		kubeClient:   kubeClient,
 		queue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "disruption"),
-		recheckQueue: workqueue.NewNamedDelayingQueue("disruption-recheck"),
+		recheckQueue: workqueue.NewNamedDelayingQueue("disruption_recheck"),
 		broadcaster:  record.NewBroadcaster(),
 	}
 	dc.recorder = dc.broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "controllermanager"})
@@ -720,9 +720,9 @@ func refresh(pdbClient policyclientset.PodDisruptionBudgetInterface, pdb *policy
 	newPdb, err := pdbClient.Get(pdb.Name, metav1.GetOptions{})
 	if err == nil {
 		return newPdb
-	} else {
-		return pdb
 	}
+	return pdb
+
 }
 
 func (dc *DisruptionController) writePdbStatus(pdb *policy.PodDisruptionBudget) error {
